@@ -40,7 +40,7 @@ struct ModConfig {
 
     // ---- Look & feel ----
     float transitionSeconds = 0.35f; // smooth camera glide when the perspective changes (0 = off)
-    bool showStatus = true;          // small on-screen diagnostics (turn off once it works)
+    bool showStatus = true;          // writes Dynamicam_status.txt (diagnostics) once a second
 
     // ---- Advanced ----
     float eyeHeightFallback = 0.0f;  // only used if auto-calibration never ran
@@ -112,7 +112,7 @@ template <> struct pl::config::Schema<dynamicam::ModConfig> {
             return {.title = "Perspective easing (seconds)", .minimum = 0.0, .maximum = 1.5};
         if (name == "showStatus")
             return {.title = "Show status overlay",
-                    .description = "Shows which hooks are working. Turn off once Dynamicam works."};
+                    .description = "Writes Dynamicam_status.txt showing which hooks work. Turn off once Dynamicam works."};
         if (name == "debugLog")
             return {.title = "Debug log"};
         return {};

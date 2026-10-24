@@ -18,9 +18,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "mod/Signatures.h"
 #include "mod/ViewLogic.h"
@@ -53,9 +57,32 @@ constexpr float kFreshSeconds = 0.25f;
 
 bool plausible(std::uintptr_t p) { return p > 0x10000 && p < 0x0000FFFFFFFFFFFFull; }
 
+// Reads game memory without ever crashing: the bytes are pushed through a pipe, and the kernel
+// reports EFAULT instead of delivering a SIGSEGV if the address is not mapped.
+bool safeRead(std::uintptr_t addr, void *out, std::size_t n) {
+    if (!plausible(addr) || n == 0 || n > 64) return false;
+    thread_local int fds[2] = {-1, -1};
+    if (fds[0] < 0) {
+        if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+            fds[0] = fds[1] = -1;
+            return false;
+        }
+    }
+    const ssize_t w = write(fds[1], reinterpret_cast<const void *>(addr), n);
+    if (w != static_cast<ssize_t>(n)) {
+        // drain anything partial so the pipe stays empty
+        char junk[64];
+        while (read(fds[0], junk, sizeof junk) > 0) {
+        }
+        return false;
+    }
+    return read(fds[0], out, n) == static_cast<ssize_t>(n);
+}
+
 template <class T> bool readMem(std::uintptr_t addr, T &out) {
-    if (!plausible(addr)) return false;
-    out = *reinterpret_cast<const T *>(addr);
+    T tmp{};
+    if (!safeRead(addr, &tmp, sizeof(T))) return false;
+    out = tmp;
     return true;
 }
 
@@ -95,6 +122,7 @@ Clock::time_point gLastRender{};
 // diagnostics
 std::atomic<bool> gHookOk[5];            // T P R F L
 std::atomic<unsigned> gCalls[3];         // tick, perspective, render
+std::atomic<unsigned> gFail[3];          // tick: component ptr / value read / not finite
 std::atomic<bool> gSnapFresh{false};
 Clock::time_point gLastStatus{};
 
@@ -156,11 +184,20 @@ void tickDetour(void *player) {
     const auto base = reinterpret_cast<std::uintptr_t>(player);
 
     std::uintptr_t sv = 0, rc = 0, level = 0;
-    if (!readMem(base + kActorStateVector, sv) || !readMem(base + kActorRotation, rc)) return;
+    if (!readMem(base + kActorStateVector, sv) || !readMem(base + kActorRotation, rc)) {
+        gFail[0].fetch_add(1);
+        return;
+    }
     Vec3 pos;
     Vec2f rot;
-    if (!readMem(sv, pos) || !readMem(rc, rot)) return;
-    if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) return;
+    if (!readMem(sv, pos) || !readMem(rc, rot)) {
+        gFail[1].fetch_add(1);
+        return;
+    }
+    if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) {
+        gFail[2].fetch_add(1);
+        return;
+    }
 
     int hitType = 3;
     bool hasHitPos = false;
@@ -251,19 +288,19 @@ struct RotationGuard {
     bool active = false;
 
     void apply(std::uintptr_t rotComp, float pitch, float yaw) {
-        if (!plausible(rotComp)) return;
-        auto *p = reinterpret_cast<Vec2f *>(rotComp);
+        Vec2f cur{};
+        if (!readMem(rotComp, cur)) return;
         comp = rotComp;
-        old = *p;
+        old = cur;
         wrote = Vec2f{pitch, yaw};
-        *p = wrote;
+        *reinterpret_cast<Vec2f *>(comp) = wrote;
         active = true;
     }
     ~RotationGuard() {
         if (!active) return;
-        auto *p = reinterpret_cast<Vec2f *>(comp);
+        Vec2f cur{};
         // only restore if the game did not change it in the meantime
-        if (p->x == wrote.x && p->y == wrote.y) *p = old;
+        if (readMem(comp, cur) && cur.x == wrote.x && cur.y == wrote.y) *reinterpret_cast<Vec2f *>(comp) = old;
     }
 };
 
@@ -271,7 +308,7 @@ void adjustCamera(void *levelRenderer, const ModConfig &c, RotationGuard &guard)
     std::uintptr_t lrp = 0;
     if (!readMem(reinterpret_cast<std::uintptr_t>(levelRenderer) + kLevelRendererPlayer, lrp)) return;
     if (!plausible(lrp)) return;
-    auto *cam = reinterpret_cast<float *>(lrp + kCamPos);
+    const std::uintptr_t camAddr = lrp + kCamPos;
 
     const auto now = Clock::now();
     PlayerSnapshot s;
@@ -294,7 +331,9 @@ void adjustCamera(void *levelRenderer, const ModConfig &c, RotationGuard &guard)
     gLastRender = now;
     dt = std::clamp(dt, 0.0f, 0.1f);
 
-    const Vec3 seen{cam[0], cam[1], cam[2]};
+    Vec3 seen;
+    if (!readMem(camAddr, seen)) return;
+    auto *cam = reinterpret_cast<float *>(camAddr);
     if (!std::isfinite(seen.x) || !std::isfinite(seen.y) || !std::isfinite(seen.z)) return;
 
     // If the game did not rewrite the camera this frame, what we see is our own output.
@@ -372,47 +411,36 @@ void adjustCamera(void *levelRenderer, const ModConfig &c, RotationGuard &guard)
         guard.apply(s.rotComp, out.pitch, out.yaw);
 }
 
-// Small diagnostics overlay so it is obvious which hooks are alive.
+// Writes status.txt once a second (no UI calls from the render thread - those are not safe).
+std::string gStatusPaths[2];
+
 void drawStatus(const ModConfig &c) {
+    if (!c.showStatus) return;
     const auto now = Clock::now();
-    if (std::chrono::duration<float>(now - gLastStatus).count() < 0.15f) return;
+    if (std::chrono::duration<float>(now - gLastStatus).count() < 1.0f) return;
     gLastStatus = now;
 
-    std::vector<pl::modmenu::DrawCommand> cmds;
-    if (c.showStatus) {
-        const auto ok = [](int i) { return gHookOk[i].load() ? "ok" : "MISSING"; };
-        char l1[160], l2[160], l3[160];
-        std::snprintf(l1, sizeof l1, "Dynamicam  hooks  tick:%s  persp:%s  render:%s  fov:%s  turn:%s", ok(0), ok(1),
-                      ok(2), ok(3), ok(4));
-        std::snprintf(l2, sizeof l2, "calls  tick:%u  persp:%u  render:%u", gCalls[0].load(), gCalls[1].load(),
-                      gCalls[2].load());
-        std::snprintf(l3, sizeof l3, "view:%d  body:%s  eye-cal:%s(%.2f)  player-data:%s  easing:%s",
-                      gNativePerspective.load(), gFaked.load() ? "ON" : "off", gCalibrated.load() ? "yes" : "no",
-                      eyeDelta(c), gSnapFresh.load() ? "yes" : "NO", gTrans < 1.0f ? "playing" : "idle");
-
-        const char *lines[3] = {l1, l2, l3};
-        pl::modmenu::DrawCommand bg{};
-        bg.type = pl::modmenu::DrawCommandType::RectFilled;
-        bg.x = 8.0f;
-        bg.y = 90.0f;
-        bg.w = 640.0f;
-        bg.h = 74.0f;
-        bg.color = 0xA0000000u;
-        cmds.push_back(bg);
-        for (int i = 0; i < 3; i++) {
-            pl::modmenu::DrawCommand t{};
-            t.type = pl::modmenu::DrawCommandType::Text;
-            t.x = 16.0f;
-            t.y = 96.0f + 22.0f * i;
-            t.w = 1.0f;
-            t.h = 1.0f;
-            t.size = 16.0f;
-            t.color = 0xFFFFFFFFu;
-            t.text = lines[i];
-            cmds.push_back(std::move(t));
-        }
+    const auto ok = [](int i) { return gHookOk[i].load() ? "ok" : "MISSING"; };
+    char buf[900];
+    std::snprintf(buf, sizeof buf,
+                  "Dynamicam status\n"
+                  "hooks: tick=%s perspective=%s render=%s fov=%s turn=%s\n"
+                  "calls: tick=%u perspective=%u render=%u\n"
+                  "tick read failures: ptr=%u value=%u notfinite=%u\n"
+                  "player data fresh: %s\n"
+                  "game view: %d (0 first, 1 back, 2 front)\n"
+                  "body mode on: %s\n"
+                  "eye calibrated: %s (delta %.3f)\n"
+                  "easing: %s\n",
+                  ok(0), ok(1), ok(2), ok(3), ok(4), gCalls[0].load(), gCalls[1].load(), gCalls[2].load(),
+                  gFail[0].load(), gFail[1].load(), gFail[2].load(), gSnapFresh.load() ? "yes" : "NO",
+                  gNativePerspective.load(), gFaked.load() ? "yes" : "no", gCalibrated.load() ? "yes" : "no",
+                  eyeDelta(c), gTrans < 1.0f ? "playing" : "idle");
+    for (const auto &path : gStatusPaths) {
+        if (path.empty()) continue;
+        std::ofstream f(path, std::ios::trunc);
+        if (f) f << buf;
     }
-    pl::modmenu::submitDrawCommands(kModuleId, cmds);
 }
 
 void renderLevelDetour(void *self, void *screenContext, void *a3) {
@@ -510,6 +538,8 @@ bool DynamicamMod::load() {
 
 bool DynamicamMod::enable() {
     auto &log = getSelf().getLogger();
+    gStatusPaths[0] = "/storage/emulated/0/Android/media/org.levimc.launcher/Dynamicam_status.txt";
+    gStatusPaths[1] = (getSelf().getDataDir() / "status.txt").string();
     installHooks();
     registerMenu();
     log.info("Dynamicam enabled");
