@@ -20,6 +20,11 @@ Everything is adjustable in the in-game **Mod Menu → Dynamicam** (distance, si
 - `Eye height fallback` – only if your first-person camera sits at your feet (try `1.62`).
 - If a Minecraft update breaks it, the log says which signature was not found; new patterns go in `src/mod/Signatures.h`.
 
+## Diagnostics
+Dynamicam writes `Dynamicam_status.txt` (once a second) to
+`/storage/emulated/0/Android/media/org.levimc.launcher/` showing which hooks work. Turn it off with
+"Show status overlay" in the menu when everything works.
+
 ## Logo
 Put your logo at the repo root as `icon.png` and build with `-DMOD_ICON=icon.png`
 (or set `MOD_ICON` in `CMakeLists.txt`).
